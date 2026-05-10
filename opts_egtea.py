@@ -102,7 +102,42 @@ def parse_opt():
         '--dec_head',
         type=int,
         default=4)
-        
+    parser.add_argument(
+        '--DSE',
+        default=False,
+        action='store_true',
+        help='Enable Dual-Scale Temporal Encoder. When omitted, MyNet runs as the baseline without DSE.')
+    parser.add_argument(
+        '--MTL',
+        default=False,
+        action='store_true',
+        help='Enable Multi-Task auxiliary snippet-level classification head.')
+    parser.add_argument(
+        '--CB',
+        default=False,
+        action='store_true',
+        help='Enable Class-Balanced focal loss using inverse-frequency weights from action_frame_count.')
+    parser.add_argument(
+        '--lambda_mtl',
+        type=float,
+        default=0.3,
+        help='Weight for the auxiliary snippet-level classification loss.')
+    parser.add_argument(
+        '--cb_beta',
+        type=float,
+        default=0.999,
+        help='Beta for class-balanced re-weighting (Cui et al. CVPR 2019). Higher = stronger reweighting.')
+    parser.add_argument(
+        '--DIOU',
+        default=False,
+        action='store_true',
+        help='Enable DIoU regression loss instead of plain L1. Targets high-IoU mAP and AEDT.')
+    parser.add_argument(
+        '--diou_l1_weight',
+        type=float,
+        default=0.2,
+        help='Weight of the auxiliary L1 term added to DIoU loss for early-training stability.')
+
     # Training settings
     parser.add_argument(
         '--batch_size',
