@@ -94,6 +94,8 @@ class MYNET(torch.nn.Module):
         dropout = 0.3
         self.best_loss = 1000000
         self.best_map = 0
+        self.use_dse = bool(opt.get("DSE", False))
+        self.use_mtl = bool(opt.get("MTL", False))
         
         # Enhanced feature reduction with dynamic dropout
         self.feature_reduction_rgb = nn.Sequential(
@@ -117,12 +119,15 @@ class MYNET(torch.nn.Module):
             scale_factor=0.5
         )
         
-        # Unified Dual-Scale Temporal Encoder
-        self.temporal_encoder = DualScaleTemporalEncoder(
-            embedding_dim=n_embedding_dim,
-            num_heads=n_enc_head,
-            dropout=dropout
-        )
+        # Unified Dual-Scale Temporal Encoder (only built when --DSE is enabled)
+        if self.use_dse:
+            self.temporal_encoder = DualScaleTemporalEncoder(
+                embedding_dim=n_embedding_dim,
+                num_heads=n_enc_head,
+                dropout=dropout
+            )
+        else:
+            self.temporal_encoder = None
         
         # Main encoder (adaptive layers)
         self.encoder_layers = nn.ModuleList([
@@ -158,13 +163,36 @@ class MYNET(torch.nn.Module):
             nn.Linear(n_embedding_dim, n_class)
         )
         self.regressor = nn.Sequential(
-            nn.Linear(n_embedding_dim, n_embedding_dim), 
-            nn.GELU(), 
+            nn.Linear(n_embedding_dim, n_embedding_dim),
+            nn.GELU(),
             nn.LayerNorm(n_embedding_dim),
             nn.Dropout(dropout),
             nn.Linear(n_embedding_dim, 2)
         )
-        
+
+        # Auxiliary snippet-level head: attention-pooled multi-label classifier
+        # over the entire encoded segment. Provides a global-context signal that
+        # regularizes the per-anchor classifier. Only built when --MTL is set.
+        if self.use_mtl:
+            self.snip_query = nn.Parameter(torch.zeros(1, 1, n_embedding_dim))
+            nn.init.normal_(self.snip_query, std=0.02)
+            self.snip_attn = nn.MultiheadAttention(
+                embed_dim=n_embedding_dim,
+                num_heads=n_enc_head,
+                dropout=dropout
+            )
+            self.snip_classifier = nn.Sequential(
+                nn.LayerNorm(n_embedding_dim),
+                nn.Linear(n_embedding_dim, n_embedding_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(n_embedding_dim, n_class)
+            )
+        else:
+            self.snip_query = None
+            self.snip_attn = None
+            self.snip_classifier = None
+
         self.decoder_token = nn.Parameter(torch.Tensor(len(self.anchors), 1, n_embedding_dim))
         nn.init.normal_(self.decoder_token, std=0.01)
         
@@ -189,12 +217,14 @@ class MYNET(torch.nn.Module):
         
         # Apply positional encoding
         pe_x = self.positional_encoding(base_x)
-        
-        # Unified Dual-Scale Temporal Processing
-        temporal_features = self.temporal_encoder(pe_x)
-        
+
+        # Unified Dual-Scale Temporal Processing (skipped in baseline mode)
+        if self.use_dse:
+            encoded_x = self.temporal_encoder(pe_x)
+        else:
+            encoded_x = pe_x
+
         # Standard encoder processing
-        encoded_x = temporal_features
         for layer in self.encoder_layers:
             encoded_x = layer(encoded_x)
         
@@ -210,10 +240,19 @@ class MYNET(torch.nn.Module):
         decoded_x = self.norm2(decoded_x + self.dropout1(decoder_token))
         
         decoded_x = decoded_x.permute([1, 0, 2])
-        
+
         anc_cls = self.classifier(decoded_x)
         anc_reg = self.regressor(decoded_x)
-        
+
+        if self.use_mtl:
+            # encoded_x: [seq_len, batch, dim] - attention-pool with learned query
+            B = encoded_x.shape[1]
+            q = self.snip_query.expand(-1, B, -1)
+            pooled, _ = self.snip_attn(q, encoded_x, encoded_x)
+            pooled = pooled.squeeze(0)  # [batch, dim]
+            snip_cls = self.snip_classifier(pooled)
+            return anc_cls, anc_reg, snip_cls
+
         return anc_cls, anc_reg
 
 
