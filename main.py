@@ -16,7 +16,7 @@ from eval import evaluation_detection
 from tensorboardX import SummaryWriter
 from dataset import VideoDataSet
 from models import MYNET, SuppressNet
-from loss_func import cls_loss_func, regress_loss_func
+from loss_func import cls_loss_func, regress_loss_func, cb_cls_loss_func, snip_loss_func, compute_cb_weights, diou_regress_loss_func
 from functools import *
 
 def setup_multi_gpu():
@@ -29,53 +29,81 @@ def setup_multi_gpu():
         return num_gpus
     return 0
 
-def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
+def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False, cb_weights=None):
     # Increase num_workers for multi-GPU setup
     num_workers = min(8, os.cpu_count())
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                 batch_size=opt['batch_size'], shuffle=True,
                                                 num_workers=num_workers, pin_memory=True,
-                                                drop_last=False)      
+                                                drop_last=False)
     epoch_cost = 0
     epoch_cost_cls = 0
     epoch_cost_reg = 0
-    
+    epoch_cost_snip = 0
+
+    use_mtl = opt.get('MTL', False)
+    use_cb = opt.get('CB', False)
+    use_diou = opt.get('DIOU', False)
+    lambda_mtl = opt.get('lambda_mtl', 0.3)
+    diou_l1_w = opt.get('diou_l1_weight', 0.2)
+
     total_iter = len(train_dataset)//opt['batch_size']
-    
-    for n_iter,(input_data,cls_label,reg_label,_) in enumerate(tqdm(train_loader)):
+
+    for n_iter, (input_data, cls_label, reg_label, snip_label) in enumerate(tqdm(train_loader)):
 
         if warmup:
             for g in optimizer.param_groups:
                 g['lr'] = n_iter * (opt['lr']) / total_iter
-        
+
         # Move data to GPU (DataParallel will handle distribution)
         input_data = input_data.float().cuda()
         cls_label = cls_label.cuda()
         reg_label = reg_label.cuda()
-        
-        act_cls, act_reg = model(input_data)
-        
-        cost_reg = 0
-        cost_cls = 0
+        if use_mtl:
+            snip_label = snip_label.cuda()
 
-        loss = cls_loss_func(cls_label, act_cls, use_focal=True)
-        cost_cls = loss
-            
-        epoch_cost_cls += cost_cls.detach().cpu().item()    
-               
-        loss = regress_loss_func(reg_label, act_reg)
-        cost_reg = loss  
-        epoch_cost_reg += cost_reg.detach().cpu().item()   
-        
-        cost = opt['alpha']*cost_cls + opt['beta']*cost_reg    
-                
-        epoch_cost += cost.detach().cpu().item() 
+        outputs = model(input_data)
+        if use_mtl:
+            act_cls, act_reg, snip_cls = outputs
+        else:
+            act_cls, act_reg = outputs
+            snip_cls = None
+
+        # anchor classifier loss (CB-focal if --CB else original focal CE)
+        if use_cb and cb_weights is not None:
+            cost_cls = cb_cls_loss_func(cls_label, act_cls, weights=cb_weights, gamma=2.0)
+        else:
+            cost_cls = cls_loss_func(cls_label, act_cls, use_focal=True)
+        epoch_cost_cls += cost_cls.detach().cpu().item()
+
+        if use_diou:
+            cost_reg = diou_regress_loss_func(
+                reg_label, act_reg,
+                anchors=opt['anchors'],
+                l1_weight=diou_l1_w
+            )
+        else:
+            cost_reg = regress_loss_func(reg_label, act_reg)
+        epoch_cost_reg += cost_reg.detach().cpu().item()
+
+        cost = opt['alpha']*cost_cls + opt['beta']*cost_reg
+
+        # auxiliary snippet-level multi-label loss
+        if use_mtl and snip_cls is not None:
+            cost_snip = snip_loss_func(
+                snip_label, snip_cls,
+                weights=cb_weights if use_cb else None
+            )
+            epoch_cost_snip += cost_snip.detach().cpu().item()
+            cost = cost + lambda_mtl * cost_snip
+
+        epoch_cost += cost.detach().cpu().item()
 
         optimizer.zero_grad()
         cost.backward()
-        optimizer.step()   
-                
-    return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg
+        optimizer.step()
+
+    return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip
 
 def eval_one_epoch(opt, model, test_dataset):
     cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(opt, model, test_dataset)
@@ -118,24 +146,47 @@ def train(opt):
     optimizer = optim.Adam(model.parameters(), lr=opt["lr"], weight_decay=opt["weight_decay"])  
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt["lr_step"])
     
-    train_dataset = VideoDataSet(opt, subset="train")      
+    train_dataset = VideoDataSet(opt, subset="train")
     test_dataset = VideoDataSet(opt, subset=opt['inference_subset'])
-    
+
+    # Class-balanced weights derived from training-set per-class frame counts.
+    # action_frame_count is populated by VideoDataSet._loadPropLabel.
+    cb_weights = None
+    if opt.get('CB', False):
+        if hasattr(train_dataset, 'action_frame_count'):
+            cb_weights = compute_cb_weights(
+                train_dataset.action_frame_count,
+                beta=opt.get('cb_beta', 0.999)
+            ).cuda()
+            print("[CB] class-balanced weights computed (beta={}). Per-class weight stats: "
+                  "min={:.3f}, mean={:.3f}, max={:.3f}".format(
+                      opt.get('cb_beta', 0.999),
+                      cb_weights[:-1].min().item(),
+                      cb_weights[:-1].mean().item(),
+                      cb_weights[:-1].max().item()))
+        else:
+            print("[CB] warning: action_frame_count missing on dataset; running without CB weights.")
+
     warmup = False
-    
-    for n_epoch in range(opt['epoch']):   
+
+    for n_epoch in range(opt['epoch']):
         if n_epoch >= 1:
             warmup = False
-        
+
         model.train()
-        n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg = train_one_epoch(opt, model, train_dataset, optimizer, warmup)
-            
+        n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip = train_one_epoch(
+            opt, model, train_dataset, optimizer, warmup, cb_weights=cb_weights
+        )
+
         writer.add_scalars('data/cost', {'train': epoch_cost/(n_iter+1)}, n_epoch)
-        print("training loss(epoch %d): %.03f, cls - %f, reg - %f, lr - %f"%(n_epoch,
-                                                                            epoch_cost/(n_iter+1),
-                                                                            epoch_cost_cls/(n_iter+1),
-                                                                            epoch_cost_reg/(n_iter+1),
-                                                                            optimizer.param_groups[-1]["lr"]))
+        snip_msg = ", snip - %f" % (epoch_cost_snip/(n_iter+1)) if opt.get('MTL', False) else ""
+        print("training loss(epoch %d): %.03f, cls - %f, reg - %f%s, lr - %f" % (
+            n_epoch,
+            epoch_cost/(n_iter+1),
+            epoch_cost_cls/(n_iter+1),
+            epoch_cost_reg/(n_iter+1),
+            snip_msg,
+            optimizer.param_groups[-1]["lr"]))
         
         scheduler.step()
         model.eval()
@@ -203,8 +254,10 @@ def eval_frame(opt, model, dataset):
         input_data = input_data.float().cuda()
         cls_label = cls_label.cuda()
         reg_label = reg_label.cuda()
-        
-        act_cls, act_reg = model(input_data)
+
+        outputs = model(input_data)
+        # Model returns (cls, reg) in baseline / DSE mode and (cls, reg, snip) when --MTL is on.
+        act_cls, act_reg = outputs[0], outputs[1]
         cost_reg = 0
         cost_cls = 0
         
@@ -308,7 +361,12 @@ def eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg
         # Remove 'module.' prefix if present
         base_dict = {k.replace('module.', ''): v for k, v in base_dict.items()}
     
-    model.load_state_dict(base_dict)
+    missing, unexpected = model.load_state_dict(base_dict, strict=False)
+    if missing or unexpected:
+        print("[load_state_dict] missing keys: {}".format(missing))
+        print("[load_state_dict] unexpected keys: {}".format(unexpected))
+        print("[load_state_dict] WARNING: checkpoint architecture does not match current flags. "
+              "Did you forget to retrain after enabling --DSE/--MTL/--CB?")
     model = model.cuda()
     model.eval()
     
@@ -384,7 +442,12 @@ def test_frame(opt):
     if any(key.startswith('module.') for key in base_dict.keys()):
         base_dict = {k.replace('module.', ''): v for k, v in base_dict.items()}
     
-    model.load_state_dict(base_dict)
+    missing, unexpected = model.load_state_dict(base_dict, strict=False)
+    if missing or unexpected:
+        print("[load_state_dict] missing keys: {}".format(missing))
+        print("[load_state_dict] unexpected keys: {}".format(unexpected))
+        print("[load_state_dict] WARNING: checkpoint architecture does not match current flags. "
+              "Did you forget to retrain after enabling --DSE/--MTL/--CB?")
     model = model.cuda()
     model.eval()
     
@@ -445,7 +508,12 @@ def test(opt):
     if any(key.startswith('module.') for key in base_dict.keys()):
         base_dict = {k.replace('module.', ''): v for k, v in base_dict.items()}
     
-    model.load_state_dict(base_dict)
+    missing, unexpected = model.load_state_dict(base_dict, strict=False)
+    if missing or unexpected:
+        print("[load_state_dict] missing keys: {}".format(missing))
+        print("[load_state_dict] unexpected keys: {}".format(unexpected))
+        print("[load_state_dict] WARNING: checkpoint architecture does not match current flags. "
+              "Did you forget to retrain after enabling --DSE/--MTL/--CB?")
     model = model.cuda()
     model.eval()
     
@@ -475,7 +543,12 @@ def test_online(opt):
     if any(key.startswith('module.') for key in base_dict.keys()):
         base_dict = {k.replace('module.', ''): v for k, v in base_dict.items()}
     
-    model.load_state_dict(base_dict)
+    missing, unexpected = model.load_state_dict(base_dict, strict=False)
+    if missing or unexpected:
+        print("[load_state_dict] missing keys: {}".format(missing))
+        print("[load_state_dict] unexpected keys: {}".format(unexpected))
+        print("[load_state_dict] WARNING: checkpoint architecture does not match current flags. "
+              "Did you forget to retrain after enabling --DSE/--MTL/--CB?")
     model = model.cuda()
     model.eval()
     
@@ -522,7 +595,8 @@ def test_online(opt):
             
             minput = input_queue.unsqueeze(0)
             with torch.no_grad():
-                act_cls, act_reg = model(minput.cuda())
+                outputs = model(minput.cuda())
+                act_cls, act_reg = outputs[0], outputs[1]
                 act_cls = torch.softmax(act_cls, dim=-1)
             
             cls_anc = act_cls.squeeze(0).detach().cpu().numpy()
@@ -617,8 +691,17 @@ if __name__ == '__main__':
         # For reproducibility in multi-GPU training
         torch.cuda.manual_seed_all(seed)
            
-    opt['anchors'] = [int(item) for item in opt['anchors'].split(',')]  
-           
+    opt['anchors'] = [int(item) for item in opt['anchors'].split(',')]
+
+    print("[Config] DSE: {} | MTL: {} | CB: {} | DIOU: {} (lambda_mtl={}, cb_beta={}, diou_l1_w={})".format(
+        "ON" if opt.get('DSE', False) else "off",
+        "ON" if opt.get('MTL', False) else "off",
+        "ON" if opt.get('CB', False) else "off",
+        "ON" if opt.get('DIOU', False) else "off",
+        opt.get('lambda_mtl', 0.3),
+        opt.get('cb_beta', 0.999),
+        opt.get('diou_l1_weight', 0.2)))
+
     main(opt)
     while(opt['wterm']):
         pass
